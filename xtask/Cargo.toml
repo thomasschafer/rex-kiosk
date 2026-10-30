@@ -1,0 +1,13 @@
+[package]
+name = "xtask"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+anyhow = "1"
+rex-kiosk = { path = ".." }
+kiosk-docgen = { git = "https://github.com/thomasschafer/kiosk", rev = "269d5bf378b8dada056ed350d8d72d69b514c4a4" }
+
+[lints]
+workspace = true
