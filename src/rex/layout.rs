@@ -4,7 +4,7 @@
 use serde::Serialize;
 
 use super::SHELL_FLAVOR;
-use crate::config::{OnOpenConfig, OnOpenPaneDirection};
+use kiosk_core::config::{OnOpenConfig, on_open::OnOpenPaneDirection};
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -115,8 +115,9 @@ impl Layout {
 mod tests {
     use serde_json::json;
 
+    use kiosk_core::config::on_open::OnOpenPaneConfig;
+
     use super::*;
-    use crate::config::OnOpenPaneConfig;
 
     fn pane(command: &str, direction: OnOpenPaneDirection, ratio: Option<f64>) -> OnOpenPaneConfig {
         OnOpenPaneConfig {

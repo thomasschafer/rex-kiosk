@@ -22,6 +22,24 @@ const DOCS: ProductDocs<'static> = ProductDocs {
             "[on_open]\npanes = [\n  { command = \"hx\", direction = \"right\", ratio = 0.6 },\n]",
         ),
     ],
+    wording: &[
+        (
+            "OnOpenConfig::panes",
+            "Pane definitions, each splitting the window's first pane in order. Focus\n\
+             stays on the first pane. Panes are created only with a new window, not\n\
+             when kiosk switches to a window that is already open, and never for plain\n\
+             folders.",
+        ),
+        (
+            "OnOpenPaneConfig",
+            "A command pane created in a new window.",
+        ),
+        (
+            "OnOpenPaneConfig::command",
+            "Shell command typed into the pane's shell as it starts, in the opened checkout. \
+             The shell stays open when the command ends. The command must not be empty.",
+        ),
+    ],
 };
 
 fn main() -> Result<()> {

@@ -6,6 +6,7 @@ use std::{
 
 use kiosk_core::{
     backend::KnownCheckout,
+    config::on_open::{OnOpenPaneConfig, OnOpenPaneDirection},
     event::{AppEvent, WorktreeRemovalOutcome},
     git::{
         CliGitProvider,
@@ -16,10 +17,7 @@ use kiosk_core::{
 use tempfile::TempDir;
 
 use super::*;
-use crate::{
-    config::{OnOpenPaneConfig, OnOpenPaneDirection},
-    rex::SHELL_FLAVOR,
-};
+use crate::rex::SHELL_FLAVOR;
 
 const LOCAL_HOST: &str = "host-local";
 const APP: &str = "client:app";

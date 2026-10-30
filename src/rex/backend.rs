@@ -30,7 +30,7 @@ use super::{
     live::{self, Live, LiveSession, LiveWindow},
     path_arg,
 };
-use crate::config::OnOpenConfig;
+use kiosk_core::config::OnOpenConfig;
 
 /// The longest label Rex accepts for a session or window, in characters.
 const MAX_LABEL_CHARS: usize = 128;

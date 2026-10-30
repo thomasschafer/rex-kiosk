@@ -1,41 +1,8 @@
 //! rex-kiosk's own config sections, read beside kiosk's shared ones.
 
-use anyhow::{Result, bail};
-use kiosk_core::config::{ConfigExtension, ManagedWorktreesConfig};
+use anyhow::Result;
+use kiosk_core::config::{ConfigExtension, ManagedWorktreesConfig, OnOpenConfig};
 use serde::{Deserialize, Serialize};
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-/// Side of the window's first pane on which Rex places a configured pane.
-pub enum OnOpenPaneDirection {
-    Right,
-    Down,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-/// A command pane created in a new window.
-pub struct OnOpenPaneConfig {
-    /// Shell command typed into the pane's shell as it starts, in the opened checkout.
-    /// The shell stays open when the command ends. The command must not be empty.
-    pub command: String,
-    /// Split direction: `right` or `down`.
-    pub direction: OnOpenPaneDirection,
-    /// Fraction of the resulting split occupied by the new command pane. The value
-    /// must be greater than 0 and less than 1, and defaults to 0.5 when omitted.
-    #[serde(default)]
-    pub ratio: Option<f64>,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
-/// The section is optional and contains no pane definitions by default.
-pub struct OnOpenConfig {
-    /// Pane definitions, each splitting the window's first pane in order. Focus
-    /// stays on the first pane. Panes are created only with a new window, not
-    /// when kiosk switches to a window that is already open, and never for plain
-    /// folders.
-    pub panes: Vec<OnOpenPaneConfig>,
-}
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -53,21 +20,7 @@ pub struct Config {
 impl ConfigExtension for Config {
     fn validate(&self) -> Result<()> {
         self.worktrees.validate()?;
-        for (index, pane) in self.on_open.panes.iter().enumerate() {
-            if pane.command.trim().is_empty() {
-                bail!("on_open pane {} command must not be empty", index + 1);
-            }
-            if pane
-                .ratio
-                .is_some_and(|ratio| !ratio.is_finite() || ratio <= 0.0 || ratio >= 1.0)
-            {
-                bail!(
-                    "on_open pane {} ratio must be greater than 0 and less than 1",
-                    index + 1
-                );
-            }
-        }
-        Ok(())
+        self.on_open.validate()
     }
 }
 
@@ -76,7 +29,10 @@ pub const SOURCE: &str = include_str!("config.rs");
 
 #[cfg(test)]
 mod tests {
-    use kiosk_core::config::parse_config;
+    use kiosk_core::config::{
+        on_open::{OnOpenPaneConfig, OnOpenPaneDirection},
+        parse_config,
+    };
 
     use super::*;
 
