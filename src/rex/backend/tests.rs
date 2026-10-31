@@ -896,6 +896,7 @@ fn opening_a_branch_without_a_checkout_makes_one_in_the_worktree_directory() {
 #[test]
 fn creating_a_branch_opens_its_new_checkout() {
     let fixture = Fixture::new();
+    run_test_git(&fixture.repo, &["branch", "base"]);
     fixture.rex.add_session("repo", &[&fixture.repo]);
 
     let event = fixture.run(|git, backend, sender| {
@@ -905,7 +906,7 @@ fn creating_a_branch_opens_its_new_checkout() {
             sender,
             fixture.repo.clone(),
             "Feature/Login_Page".into(),
-            "HEAD".into(),
+            "base".into(),
         );
     });
 
