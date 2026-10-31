@@ -73,6 +73,7 @@ fn start(options: launch::Options) -> Result<()> {
             picker_block: Some(host.own_block),
         },
         Box::new(io::stdout()),
+        Box::new(rex_kiosk::rex::backend::forget_saved_removal),
     );
     let cwd = match &host.origin_block {
         Some(block) => match backend.block_folder(&host.session, block) {

@@ -88,8 +88,10 @@ your terminals are in instead:
 
 Deleting a checkout removes the worktree with Git, then closes its tab, and the session
 too when that was its last tab. When the picker is floating over the tab being closed,
-the tab's panes close at once and the tab itself closes with the picker. A checkout with
-uncommitted changes needs a second confirmation.
+the tab's panes close at once and the tab itself closes with the picker. If that tab is
+the only one in its session, which would leave the session empty, rex-kiosk closes the
+whole session, picker included, and sends a notification saying what it removed. A
+checkout with uncommitted changes needs a second confirmation.
 
 If rex-kiosk itself fails, for example on a mistake in its config, its pane stays open
 with the error until you press Enter.

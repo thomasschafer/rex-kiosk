@@ -61,6 +61,8 @@ struct FakeState {
     vanishing: Vec<String>,
     /// Sessions that close between being listed and being viewed.
     ghosts: Vec<String>,
+    /// Why forgetting a saved removal fails, if it does.
+    forget_error: Option<String>,
 }
 
 /// The parts of the Rex server kiosk uses, over in-memory sessions.
@@ -401,15 +403,28 @@ struct Fixture {
     notices: Arc<Mutex<Vec<u8>>>,
 }
 
-/// Shares written bytes with the test.
-struct SharedWriter(Arc<Mutex<Vec<u8>>>);
+/// Shares written bytes with the test, and logs what each flush sends among the Rex
+/// calls as a `notice`, so tests can see when it reached the terminal.
+struct SharedWriter {
+    written: Arc<Mutex<Vec<u8>>>,
+    unflushed: Vec<u8>,
+    rex: Arc<FakeRex>,
+}
 
 impl Write for SharedWriter {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        self.0.lock().unwrap().write(bytes)
+        self.unflushed.extend_from_slice(bytes);
+        self.written.lock().unwrap().write(bytes)
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
+        let flushed = String::from_utf8(std::mem::take(&mut self.unflushed)).unwrap();
+        self.rex
+            .state
+            .lock()
+            .unwrap()
+            .calls
+            .push(("notice".into(), flushed.into()));
         Ok(())
     }
 }
@@ -434,7 +449,12 @@ impl Fixture {
             WorktreePlacement::new(temp.path().join("worktrees")).unwrap(),
             on_open,
             launch,
-            Box::new(SharedWriter(Arc::clone(&notices))),
+            Box::new(SharedWriter {
+                written: Arc::clone(&notices),
+                unflushed: Vec::new(),
+                rex: Arc::clone(&rex),
+            }),
+            forget_logged_in(Arc::clone(&rex)),
         ));
         Self {
             temp,
@@ -496,6 +516,21 @@ impl Fixture {
         };
         outcome
     }
+}
+
+/// Logs each forgotten removal among the Rex calls as a `forget`, or fails as the fake
+/// says to.
+fn forget_logged_in(rex: Arc<FakeRex>) -> ForgetRemoval {
+    Box::new(move |checkout| {
+        let mut state = rex.state.lock().unwrap();
+        if let Some(error) = state.forget_error.clone() {
+            return Err(error);
+        }
+        state
+            .calls
+            .push(("forget".into(), checkout.to_str().unwrap().into()));
+        Ok(())
+    })
 }
 
 fn canonical(path: &Path) -> PathBuf {
@@ -931,22 +966,7 @@ fn removing_a_dirty_worktree_needs_force_and_keeps_the_window() {
 
 #[test]
 fn removing_the_checkout_the_picker_floats_over_leaves_the_window_to_close_with_it() {
-    let rex = FakeRex::with_app();
-    let fixture = Fixture::with(
-        OnOpenConfig::default(),
-        Launch {
-            client: None,
-            picker_block: Some(BlockId::try_from("block:picker".to_string()).unwrap()),
-        },
-        rex,
-    );
-    let feature = fixture.linked("feature");
-    fixture.rex.add_session("repo", &[&fixture.repo, &feature]);
-    fixture.rex.edit(|state| {
-        let mut picker = FakeRex::block(state, None);
-        picker.id = "block:picker".into();
-        state.sessions[0].windows[1].floating.push(picker);
-    });
+    let (fixture, feature) = picker_over_feature(|fixture| vec![fixture.repo.clone()]);
 
     assert_eq!(
         fixture.remove("feature", &feature, false),
@@ -957,6 +977,95 @@ fn removing_the_checkout_the_picker_floats_over_leaves_the_window_to_close_with_
     assert!(window.tiled.is_empty());
     assert_eq!(window.floating[0].id, "block:picker");
     assert_eq!(fixture.rex.change_names(), ["block.close"]);
+    assert!(fixture.notices.lock().unwrap().is_empty());
+}
+
+/// A fixture whose picker floats over the window showing a new `feature` checkout, in a
+/// session with a window for each of `folders` before it.
+fn picker_over_feature(folders: impl FnOnce(&Fixture) -> Vec<PathBuf>) -> (Fixture, PathBuf) {
+    let fixture = Fixture::with(
+        OnOpenConfig::default(),
+        Launch {
+            client: None,
+            picker_block: Some(BlockId::try_from("block:picker".to_string()).unwrap()),
+        },
+        FakeRex::with_app(),
+    );
+    let feature = fixture.linked("feature");
+    let mut folders = folders(&fixture);
+    folders.push(feature.clone());
+    let folders: Vec<&Path> = folders.iter().map(PathBuf::as_path).collect();
+    fixture.rex.add_session("repo", &folders);
+    fixture.rex.edit(|state| {
+        let mut picker = FakeRex::block(state, None);
+        picker.id = "block:picker".into();
+        state.sessions[0]
+            .windows
+            .last_mut()
+            .unwrap()
+            .floating
+            .push(picker);
+    });
+    (fixture, feature)
+}
+
+#[test]
+fn removing_the_checkout_of_the_pickers_only_window_ends_its_session_with_a_notice() {
+    let (fixture, feature) = picker_over_feature(|_| Vec::new());
+    let picker_session = fixture.rex.sessions()[0].id.clone();
+    let other = fixture.rex.add_session("other", &[&fixture.repo]);
+
+    assert_eq!(
+        fixture.remove("feature", &feature, false),
+        WorktreeRemovalOutcome::Removed { warning: None }
+    );
+
+    assert!(!feature.exists());
+    let sessions = fixture.rex.sessions();
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0].id, other.id);
+    let notice = format!(
+        "\x1b]777;notify;rex-kiosk;Removed {} and closed the repo session, which had \
+         nothing else open\x07",
+        feature.display()
+    );
+    assert_eq!(
+        fixture.rex.changes(),
+        [
+            ("forget".into(), feature.to_str().unwrap().into()),
+            ("notice".into(), notice.into()),
+            (
+                "session.destroy".into(),
+                json!({ "session_id": picker_session })
+            ),
+        ]
+    );
+}
+
+#[test]
+fn a_session_whose_removal_record_cannot_be_cleared_is_kept() {
+    let (fixture, feature) = picker_over_feature(|_| Vec::new());
+    fixture
+        .rex
+        .edit(|state| state.forget_error = Some("state file is malformed".into()));
+
+    let WorktreeRemovalOutcome::Removed {
+        warning: Some(warning),
+    } = fixture.remove("feature", &feature, false)
+    else {
+        panic!("expected a removal with a warning");
+    };
+
+    assert!(!feature.exists());
+    assert!(
+        warning.contains("could not be closed in Rex")
+            && warning.contains("could not clear the record of removing")
+            && warning.contains("state file is malformed"),
+        "{warning}"
+    );
+    assert_eq!(fixture.rex.sessions().len(), 1);
+    assert_eq!(fixture.rex.change_names(), Vec::<String>::new());
+    assert!(fixture.notices.lock().unwrap().is_empty());
 }
 
 #[test]
