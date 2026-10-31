@@ -21,7 +21,6 @@ use kiosk_core::{
     },
     git::{GitProvider, Worktree},
     path::{canonical_or_original, equivalent},
-    pending_delete::{load_pending_worktree_deletes, save_pending_worktree_deletes},
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -37,10 +36,6 @@ use kiosk_core::config::OnOpenConfig;
 /// The longest label Rex accepts for a session or window, in characters.
 const MAX_LABEL_CHARS: usize = 128;
 const APP_CLIENT: &str = "app";
-
-/// Drops kiosk's saved record that the removal of a checkout is under way, which the
-/// picker would otherwise clear once the removal finishes.
-pub type ForgetRemoval = Box<dyn Fn(&Path) -> Result<(), String> + Send + Sync>;
 
 /// How a picker started in Rex was launched.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -61,7 +56,6 @@ pub struct Rex {
     /// Where notifications are written, as terminal escape sequences: the picker's own
     /// terminal, which passes them to the Rex app.
     notices: Mutex<Box<dyn Write + Send>>,
-    forget_removal: ForgetRemoval,
     host_id: OnceLock<String>,
     /// The checkout each window was last listed as showing, so a window can be named by
     /// its checkout once that is gone.
@@ -118,7 +112,6 @@ impl Rex {
         on_open: OnOpenConfig,
         launch: Launch,
         notices: Box<dyn Write + Send>,
-        forget_removal: ForgetRemoval,
     ) -> Self {
         Self {
             api,
@@ -127,7 +120,6 @@ impl Rex {
             on_open,
             launch,
             notices: Mutex::new(notices),
-            forget_removal,
             host_id: OnceLock::new(),
             shown: Mutex::new(HashMap::new()),
         }
@@ -500,9 +492,8 @@ impl ManagedWorktrees<Self> for Rex {
 
 impl Rex {
     /// Destroys the picker's own session after removing the checkout its only window
-    /// showed. The picker ends with it, before it can clear its record of the removal,
-    /// so that is cleared here first: left behind, it would remove a new checkout of the
-    /// same branch at the same path.
+    /// showed. The picker ends with it, which is safe as kiosk-core forgets its record
+    /// of the removal before asking for the close.
     fn end_picker_session(
         &self,
         session: &LiveSession,
@@ -513,12 +504,6 @@ impl Rex {
             RexError::InvalidArgument(format!(
                 "{} was never listed as showing a checkout",
                 target.window
-            ))
-        })?;
-        (self.forget_removal)(&checkout).map_err(|error| {
-            RexError::Invocation(format!(
-                "could not clear the record of removing {}: {error}",
-                kiosk_core::path::display(&checkout)
             ))
         })?;
         self.notify(
@@ -532,30 +517,6 @@ impl Rex {
         self.call("session.destroy", &json!({ "session_id": target.session }))?;
         Ok(())
     }
-}
-
-/// Drops the saved record of removing `checkout` from rex-kiosk's pending-delete state.
-pub fn forget_saved_removal(checkout: &Path) -> Result<(), String> {
-    let loaded = load_pending_worktree_deletes(&crate::PRODUCT);
-    if !loaded.warnings.is_empty() {
-        return Err(loaded
-            .warnings
-            .iter()
-            .map(|warning| warning.message.as_str())
-            .collect::<Vec<_>>()
-            .join("; "));
-    }
-    let checkout = canonical_or_original(checkout);
-    let kept: Vec<_> = loaded
-        .entries
-        .iter()
-        .filter(|entry| !equivalent(&canonical_or_original(&entry.worktree_path), &checkout))
-        .cloned()
-        .collect();
-    if kept.len() == loaded.entries.len() {
-        return Ok(());
-    }
-    save_pending_worktree_deletes(&crate::PRODUCT, &kept).map_err(|error| format!("{error:#}"))
 }
 
 /// A label naming `path` by its last component.

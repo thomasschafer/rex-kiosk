@@ -61,8 +61,6 @@ struct FakeState {
     vanishing: Vec<String>,
     /// Sessions that close between being listed and being viewed.
     ghosts: Vec<String>,
-    /// Why forgetting a saved removal fails, if it does.
-    forget_error: Option<String>,
 }
 
 /// The parts of the Rex server kiosk uses, over in-memory sessions.
@@ -454,7 +452,6 @@ impl Fixture {
                 unflushed: Vec::new(),
                 rex: Arc::clone(&rex),
             }),
-            forget_logged_in(Arc::clone(&rex)),
         ));
         Self {
             temp,
@@ -491,15 +488,29 @@ impl Fixture {
     }
 
     fn run(&self, start: impl FnOnce(&Arc<dyn GitProvider>, &Arc<Rex>, &EventSender)) -> AppEvent {
+        Self::next(&self.start(start))
+    }
+
+    fn start(
+        &self,
+        start: impl FnOnce(&Arc<dyn GitProvider>, &Arc<Rex>, &EventSender),
+    ) -> mpsc::Receiver<AppEvent> {
         let git: Arc<dyn GitProvider> = Arc::new(CliGitProvider);
         let (tx, rx) = mpsc::channel();
         let sender = EventSender::new(tx, Arc::new(AtomicBool::new(false)));
         start(&git, &self.backend, &sender);
-        rx.recv_timeout(Duration::from_secs(10)).unwrap()
+        rx
     }
 
+    fn next(events: &mpsc::Receiver<AppEvent>) -> AppEvent {
+        events.recv_timeout(Duration::from_secs(10)).unwrap()
+    }
+
+    /// Removes `checkout` as the picker does. Before a session is closed, the picker
+    /// forgets its record of the removal, which is logged among the Rex calls as a
+    /// `forget` so tests can see it comes first.
     fn remove(&self, branch: &str, checkout: &Path, force: bool) -> WorktreeRemovalOutcome {
-        let event = self.run(|git, backend, sender| {
+        let events = self.start(|git, backend, sender| {
             spawn_worktree_removal(
                 git,
                 backend,
@@ -511,26 +522,26 @@ impl Fixture {
                 force,
             );
         });
+        let mut event = Self::next(&events);
+        if let AppEvent::CheckoutRemoved {
+            worktree_path,
+            gate,
+        } = event
+        {
+            self.rex.edit(|state| {
+                state
+                    .calls
+                    .push(("forget".into(), worktree_path.to_str().unwrap().into()));
+            });
+            // Dropping the gate lets the removal go on to close the session.
+            drop(gate);
+            event = Self::next(&events);
+        }
         let AppEvent::WorktreeRemovalFinished { outcome, .. } = event else {
             panic!("expected a removal, got {event:?}");
         };
         outcome
     }
-}
-
-/// Logs each forgotten removal among the Rex calls as a `forget`, or fails as the fake
-/// says to.
-fn forget_logged_in(rex: Arc<FakeRex>) -> ForgetRemoval {
-    Box::new(move |checkout| {
-        let mut state = rex.state.lock().unwrap();
-        if let Some(error) = state.forget_error.clone() {
-            return Err(error);
-        }
-        state
-            .calls
-            .push(("forget".into(), checkout.to_str().unwrap().into()));
-        Ok(())
-    })
 }
 
 fn canonical(path: &Path) -> PathBuf {
@@ -936,7 +947,9 @@ fn removing_a_worktree_closes_its_window_and_an_emptied_session() {
     assert_eq!(
         fixture.rex.change_names(),
         [
+            "forget",
             "session.close_window",
+            "forget",
             "session.close_window",
             "session.destroy"
         ]
@@ -976,7 +989,7 @@ fn removing_the_checkout_the_picker_floats_over_leaves_the_window_to_close_with_
     let window = &fixture.rex.sessions()[0].windows[1];
     assert!(window.tiled.is_empty());
     assert_eq!(window.floating[0].id, "block:picker");
-    assert_eq!(fixture.rex.change_names(), ["block.close"]);
+    assert_eq!(fixture.rex.change_names(), ["forget", "block.close"]);
     assert!(fixture.notices.lock().unwrap().is_empty());
 }
 
@@ -1040,32 +1053,6 @@ fn removing_the_checkout_of_the_pickers_only_window_ends_its_session_with_a_noti
             ),
         ]
     );
-}
-
-#[test]
-fn a_session_whose_removal_record_cannot_be_cleared_is_kept() {
-    let (fixture, feature) = picker_over_feature(|_| Vec::new());
-    fixture
-        .rex
-        .edit(|state| state.forget_error = Some("state file is malformed".into()));
-
-    let WorktreeRemovalOutcome::Removed {
-        warning: Some(warning),
-    } = fixture.remove("feature", &feature, false)
-    else {
-        panic!("expected a removal with a warning");
-    };
-
-    assert!(!feature.exists());
-    assert!(
-        warning.contains("could not be closed in Rex")
-            && warning.contains("could not clear the record of removing")
-            && warning.contains("state file is malformed"),
-        "{warning}"
-    );
-    assert_eq!(fixture.rex.sessions().len(), 1);
-    assert_eq!(fixture.rex.change_names(), Vec::<String>::new());
-    assert!(fixture.notices.lock().unwrap().is_empty());
 }
 
 #[test]
