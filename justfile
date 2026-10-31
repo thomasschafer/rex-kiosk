@@ -13,3 +13,6 @@ readme:
 
 readme-check:
     cargo --locked xtask readme --check
+
+preview:
+    scripts/preview.sh
