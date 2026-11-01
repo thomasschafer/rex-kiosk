@@ -1,5 +1,5 @@
-//! Talking to the Rex server through its CLI, `rex api call`, and the IDs and errors
-//! that go with it.
+//! Talking to the Rex server through its CLI, with `rex api call` and Lua scripts run by
+//! `rex do`, and the IDs and errors that go with it.
 
 use std::{
     fmt,
@@ -13,6 +13,7 @@ use serde_json::Value;
 pub mod backend;
 mod layout;
 mod live;
+pub mod scripts;
 
 pub use backend::Rex;
 
@@ -84,9 +85,11 @@ rex_id!(
 );
 
 /// A window and the session it is in: what kiosk opens a checkout or folder in.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct WindowRef {
+    #[serde(rename = "session_id")]
     pub session: SessionId,
+    #[serde(rename = "window_id")]
     pub window: WindowId,
 }
 
@@ -148,13 +151,13 @@ impl std::error::Error for RexError {}
 pub trait RexApi: Send + Sync {
     /// Calls `method` with `args` and returns its result.
     fn call(&self, method: &str, args: &Value) -> Result<Value, RexError>;
-    /// Asks `client` to perform one of its own actions, such as showing a session.
-    fn perform(&self, client: &ClientId, action: &str, args: &Value) -> Result<(), RexError>;
+    /// Runs `script` with `args` as `rex.args`, and returns what it returns. A script
+    /// that fails with a server's error fails with that error.
+    fn script(&self, script: &scripts::Script, args: &Value) -> Result<Value, RexError>;
 }
 
-/// Calls methods with a `rex` binary: `rex api call METHOD ARGS`, and performs client
-/// actions with `rex -C CLIENT do ACTION`, which explains a refusal in terms of the app's
-/// settings.
+/// Calls methods with a `rex` binary: `rex api call METHOD ARGS`, and runs scripts with
+/// `rex do -e SOURCE --args ARGS`.
 #[derive(Debug, Clone)]
 pub struct CliRex {
     binary: PathBuf,
@@ -202,34 +205,32 @@ impl RexApi for CliRex {
             &format!("api call {method}"),
             &["api", "call", method, &args.to_string()],
         )?;
-        serde_json::from_slice(&stdout).map_err(|error| {
-            RexError::InvalidResponse(format!(
-                "{method}: {error}; stdout was {:?}",
-                String::from_utf8_lossy(&stdout).trim()
-            ))
-        })
+        parse_output(method, &stdout)
     }
 
-    fn perform(&self, client: &ClientId, action: &str, args: &Value) -> Result<(), RexError> {
-        self.run(
-            &format!("do {action}"),
-            &[
-                "-C",
-                client.as_str(),
-                "do",
-                action,
-                "--args",
-                &args.to_string(),
-            ],
-        )
-        .map(drop)
+    fn script(&self, script: &scripts::Script, args: &Value) -> Result<Value, RexError> {
+        let what = format!("do {}", script.name);
+        let stdout = self.run(
+            &what,
+            &["do", "-e", script.source, "--args", &args.to_string()],
+        )?;
+        parse_output(&what, &stdout)
     }
+}
+
+fn parse_output(what: &str, stdout: &[u8]) -> Result<Value, RexError> {
+    serde_json::from_slice(stdout).map_err(|error| {
+        RexError::InvalidResponse(format!(
+            "{what}: {error}; stdout was {:?}",
+            String::from_utf8_lossy(stdout).trim()
+        ))
+    })
 }
 
 /// Reads a refusal from `rex`'s standard error, which ends its first line with the
 /// server's status and code: `Error: ...: session X not found (status=404
 /// code=session_not_found)`.
-fn parse_failure(stderr: &str) -> Option<RexError> {
+pub(crate) fn parse_failure(stderr: &str) -> Option<RexError> {
     let line = stderr.lines().next()?.trim();
     let line = line.strip_prefix("Error: ").unwrap_or(line);
     let (message, details) = line.strip_suffix(')')?.rsplit_once(" (status=")?;
@@ -360,19 +361,42 @@ mod tests {
         }
 
         #[test]
-        fn client_actions_name_the_client_and_pass_json_args() {
-            let (temp, rex) = fake_rex(r#"printf '%s\n' "$@" > "$(dirname "$0")/argv""#);
+        fn scripts_pass_their_source_and_json_args_as_words() {
+            let (temp, rex) =
+                fake_rex(r#"printf '%s\n' "$@" > "$(dirname "$0")/argv"; echo '[1]'"#);
+            let script = scripts::Script {
+                name: "probe",
+                source: "return { 1 }",
+            };
 
-            rex.perform(
-                &ClientId::try_from("client:7".to_string()).unwrap(),
-                "session.select",
-                &serde_json::json!({ "session_id": "session:1" }),
-            )
-            .unwrap();
+            let result = rex
+                .script(&script, &serde_json::json!({ "session_id": "session:1" }))
+                .unwrap();
 
+            assert_eq!(result, serde_json::json!([1]));
             assert_eq!(
                 fs::read_to_string(temp.path().join("argv")).unwrap(),
-                "-C\nclient:7\ndo\nsession.select\n--args\n{\"session_id\":\"session:1\"}\n"
+                "do\n-e\nreturn { 1 }\n--args\n{\"session_id\":\"session:1\"}\n"
+            );
+        }
+
+        #[test]
+        fn a_script_failing_with_a_servers_error_reports_it() {
+            let (_temp, rex) = fake_rex(
+                "echo 'Error: stream response \"control-3\" failed: session session:9 not \
+                 found (status=404 code=session_not_found)' >&2; exit 1",
+            );
+            let script = scripts::Script {
+                name: "probe",
+                source: "",
+            };
+
+            assert_eq!(
+                rex.script(&script, &Value::Null).unwrap_err(),
+                RexError::Api {
+                    code: "session_not_found".into(),
+                    message: "session session:9 not found".into(),
+                }
             );
         }
 

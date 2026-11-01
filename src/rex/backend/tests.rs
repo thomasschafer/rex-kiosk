@@ -1,4 +1,6 @@
 use std::{
+    cell::RefCell,
+    collections::HashSet,
     fs,
     sync::{atomic::AtomicBool, mpsc},
     time::Duration,
@@ -14,10 +16,11 @@ use kiosk_core::{
     },
     spawn::{EventSender, spawn_create_new_branch, spawn_open_branch, spawn_worktree_removal},
 };
+use mlua::{Lua, LuaSerdeExt};
 use tempfile::TempDir;
 
 use super::*;
-use crate::rex::SHELL_FLAVOR;
+use crate::rex::{SHELL_FLAVOR, WindowId, parse_failure, scripts::Script};
 
 const LOCAL_HOST: &str = "host-local";
 const APP: &str = "client:app";
@@ -69,14 +72,19 @@ struct FakeRex {
     state: Mutex<FakeState>,
 }
 
-const READS: [&str; 6] = [
+const READS: [&str; 7] = [
     "server.status",
     "session.list",
+    "session.attach",
     "session.view",
     "client.list",
     "com.superlogical.terminal.process",
     "com.superlogical.terminal.pwd",
 ];
+
+/// What the app says when Remote Control is off.
+const REMOTE_CONTROL_OFF: &str =
+    "Rex.app is not accepting actions. Turn on Remote Control in its Settings under Rex Server.";
 
 impl FakeRex {
     fn with_app() -> Self {
@@ -285,6 +293,22 @@ fn clients(state: &FakeState) -> Value {
     json!({ "clients": apps.chain([cli]).collect::<Vec<_>>() })
 }
 
+/// What the app answers when asked to perform an action.
+fn perform(state: &FakeState, args: &Value) -> Result<Value, RexError> {
+    assert_eq!(args["action"], "session.select");
+    if let Some(error) = state.perform_error.clone() {
+        return Err(error);
+    }
+    let client = args["client_id"].as_str().unwrap();
+    if !state.apps.iter().any(|(id, _)| id == client) {
+        return Err(RexError::Api {
+            code: "client_not_found".into(),
+            message: format!("client {client} not found"),
+        });
+    }
+    Ok(json!({ "performed_by": client }))
+}
+
 impl RexApi for FakeRex {
     fn call(&self, method: &str, args: &Value) -> Result<Value, RexError> {
         let mut state = self.state.lock().unwrap();
@@ -296,6 +320,10 @@ impl RexApi for FakeRex {
             }).chain(state.ghosts.iter().map(|id| json!({ "session_id": id, "label": "ghost" })))
                 .collect::<Vec<_>>() })),
             "session.view" => Ok(view(&state.sessions[session_index(&state, args)?])),
+            "session.attach" => Ok(json!({
+                "client_id": "client:cli",
+                "view": view(&state.sessions[session_index(&state, args)?]),
+            })),
             "com.superlogical.terminal.process" | "com.superlogical.terminal.pwd" => {
                 terminal(&state, method, args)
             }
@@ -370,26 +398,77 @@ impl RexApi for FakeRex {
                 Ok(json!({ "block_id": id, "revision": 5 }))
             }
             "client.list" => Ok(clients(&state)),
+            "client.perform" => perform(&state, args),
             other => panic!("unexpected call {other} {args}"),
         }
     }
 
-    fn perform(&self, client: &ClientId, action: &str, args: &Value) -> Result<(), RexError> {
-        let mut state = self.state.lock().unwrap();
-        state.calls.push((
-            format!("do {action}"),
-            json!({ "client": client.as_str(), "args": args }),
-        ));
-        assert_eq!(action, "session.select");
-        if let Some(error) = state.perform_error.clone() {
-            return Err(error);
-        }
-        if !state.apps.iter().any(|(id, _)| id == client.as_str()) {
-            return Err(RexError::Invocation(format!(
-                "client target {client:?} not found"
-            )));
-        }
-        Ok(())
+    /// Runs `script` as `rex do` does, with `rex.call` calling the fake server over a
+    /// connection that, as Rex's does, must attach to a session before acting on it or
+    /// its blocks. Values cross between Lua and JSON as Rex converts them: an
+    /// empty table becomes an empty object, and `null` becomes `nil`.
+    fn script(&self, script: &Script, args: &Value) -> Result<Value, RexError> {
+        let lua = Lua::new();
+        let to_lua = mlua::serde::SerializeOptions::new()
+            .set_array_metatable(false)
+            .serialize_none_to_null(false)
+            .serialize_unit_to_null(false);
+        let attached = RefCell::new(HashSet::new());
+        let outcome = lua.scope(|scope| {
+            let call = scope.create_function(|lua, (method, args): (String, mlua::Value)| {
+                let args: Value = lua.from_value(args)?;
+                let session = args["session_id"].as_str().map(str::to_owned);
+                let unattached = session
+                    .as_ref()
+                    .filter(|session| {
+                        method != "session.attach" && !attached.borrow().contains(*session)
+                    })
+                    .cloned();
+                let result = if let Some(session) = unattached {
+                    Err(RexError::Api {
+                        code: "conflict".into(),
+                        message: format!("stream is not attached to session {session}"),
+                    })
+                } else {
+                    self.call(&method, &args)
+                };
+                match result {
+                    Ok(result) => {
+                        if method == "session.attach" {
+                            attached
+                                .borrow_mut()
+                                .insert(session.expect("attach names a session"));
+                        }
+                        Ok((lua.to_value_with(&result, to_lua)?, None))
+                    }
+                    Err(RexError::Api { code, message }) => Ok((
+                        mlua::Value::Nil,
+                        Some(format!(
+                            "stream response \"control-1\" failed: {message} (status=400 \
+                             code={code})"
+                        )),
+                    )),
+                    Err(error) => Ok((mlua::Value::Nil, Some(error.to_string()))),
+                }
+            })?;
+            let sleep = scope.create_function(|_, seconds: f64| {
+                assert!(seconds > 0.0 && seconds < 1.0, "slept for {seconds}s");
+                Ok(())
+            })?;
+            let rex = lua.create_table()?;
+            rex.set("call", call)?;
+            rex.set("sleep", sleep)?;
+            rex.set("args", lua.to_value_with(args, to_lua)?)?;
+            lua.globals().set("rex", rex)?;
+            let returned: mlua::Value = lua.load(script.source).set_name(script.name).eval()?;
+            lua.from_value::<Value>(returned)
+        });
+        outcome.map_err(|error| match error {
+            mlua::Error::RuntimeError(message) => {
+                parse_failure(&format!("Error: {message}")).unwrap_or(RexError::Invocation(message))
+            }
+            other => panic!("{} failed: {other}", script.name),
+        })
     }
 }
 
@@ -562,8 +641,8 @@ fn show_calls(session: &str, window: &str) -> Vec<(String, Value)> {
     vec![
         ("session.focus_window".into(), ids.clone()),
         (
-            "do session.select".into(),
-            json!({ "client": APP, "args": ids }),
+            "client.perform".into(),
+            json!({ "client_id": APP, "action": "session.select", "args": ids }),
         ),
     ]
 }
@@ -1060,11 +1139,10 @@ fn removing_the_checkout_of_the_pickers_only_window_ends_its_session_with_a_noti
 fn remote_control_being_off_says_how_to_turn_it_on() {
     let rex = FakeRex::with_app();
     rex.edit(|state| {
-        state.perform_error = Some(RexError::Invocation(
-            "rex do session.select exited with exit status: 1: Error: Rex.app is not \
-             accepting actions. Turn on Remote Control in its Settings under Rex Server."
-                .into(),
-        ));
+        state.perform_error = Some(RexError::Api {
+            code: "refused".into(),
+            message: REMOTE_CONTROL_OFF.into(),
+        });
     });
     let fixture = Fixture::with(OnOpenConfig::default(), Launch::default(), rex);
 
@@ -1098,7 +1176,7 @@ fn the_launching_app_is_used_or_else_the_only_one_connected() {
         .backend
         .open_checkout(&fixture.repo, &fixture.repo)
         .unwrap();
-    assert_eq!(fixture.rex.changes()[2].1["client"], "client:second");
+    assert_eq!(fixture.rex.changes()[2].1["client_id"], "client:second");
 
     let rex = FakeRex::with_app();
     rex.edit(|state| state.apps.push(("client:second".into(), "iPad".into())));
@@ -1163,4 +1241,75 @@ fn long_labels_are_cut_to_what_rex_accepts() {
     let long = "b".repeat(200);
     assert_eq!(truncate_label(&long).chars().count(), MAX_LABEL_CHARS);
     assert_eq!(truncate_label("main"), "main");
+}
+
+#[test]
+fn git_is_asked_about_each_folder_once() {
+    let fixture = Fixture::new();
+    let plain = fixture.folder("plain");
+    let feature = fixture.linked("feature");
+
+    let first = fixture
+        .backend
+        .main_checkouts(&[plain.clone(), feature.clone(), plain.clone()])
+        .unwrap();
+    run_test_git(&plain, &["init", "--quiet"]);
+    let again = fixture.backend.main_checkouts(&[feature, plain]).unwrap();
+
+    let main = |found: &Option<PathBuf>| found.as_deref().map(canonical);
+    assert_eq!(
+        first.iter().map(main).collect::<Vec<_>>(),
+        [None, Some(fixture.repo.clone()), None]
+    );
+    assert_eq!(
+        again.iter().map(main).collect::<Vec<_>>(),
+        [Some(fixture.repo.clone()), None],
+        "the folder made a repository since is still remembered as none"
+    );
+}
+
+#[test]
+fn a_block_that_closed_has_no_folder_and_one_without_a_process_folder_reports_its_own() {
+    let fixture = Fixture::new();
+    let session = fixture
+        .rex
+        .add_session("x", &[&fixture.repo, &fixture.repo]);
+    let block =
+        |index: usize| BlockId::try_from(session.windows[index].tiled[0].id.clone()).unwrap();
+    fixture.rex.edit(|state| {
+        state.vanishing.push(session.windows[0].tiled[0].id.clone());
+        let reporting = &mut state.sessions[0].windows[1].tiled[0];
+        reporting.folder = None;
+        reporting.pwd = Some("file:///srv/My%20App".into());
+    });
+    let id = SessionId::try_from(session.id.clone()).unwrap();
+
+    assert_eq!(fixture.backend.block_folder(&id, &block(0)).unwrap(), None);
+    assert_eq!(
+        fixture.backend.block_folder(&id, &block(1)).unwrap(),
+        Some(PathBuf::from("/srv/My App"))
+    );
+}
+
+#[test]
+fn sessions_and_windows_without_terminals_are_listed_empty() {
+    let fixture = Fixture::new();
+    let empty = fixture.rex.add_session("empty", &[]);
+    let floating = fixture.rex.add_session("floating", &[&fixture.repo]);
+    fixture.rex.edit(|state| {
+        let window = &mut state.sessions[1].windows[0];
+        window.floating = std::mem::take(&mut window.tiled);
+    });
+
+    let live = fixture.backend.live().unwrap();
+
+    assert_eq!(live.sessions.len(), 2);
+    assert_eq!(live.sessions[0].label, empty.label);
+    assert_eq!(live.sessions[0].windows, []);
+    let window = &live.sessions[1].windows[0];
+    assert_eq!(window.folders, []);
+    assert_eq!(
+        window.blocks,
+        [BlockId::try_from(floating.windows[0].tiled[0].id.clone()).unwrap()]
+    );
 }
