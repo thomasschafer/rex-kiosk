@@ -2,16 +2,16 @@
 //! terminals is in. Sessions and windows have only user-editable labels, so kiosk tells
 //! what a window shows by where its terminals are.
 
-use std::path::PathBuf;
+use std::{fmt, marker::PhantomData, path::PathBuf};
 
 use kiosk_core::backend::identity::LiveFolder;
-use serde::Deserialize;
+use serde::{
+    Deserialize, Deserializer,
+    de::{self, MapAccess, SeqAccess, Visitor},
+};
 use serde_json::json;
 
-use super::{BlockId, RexApi, RexError, SessionId, WindowId, WindowRef, decode};
-
-const TERMINAL_CREATOR: &str = "com.superlogical.terminal";
-const TILED_LAYER: &str = "tiled";
+use super::{BlockId, RexApi, RexError, SessionId, WindowId, WindowRef, decode, scripts};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Live {
@@ -93,127 +93,67 @@ impl Live {
 }
 
 #[derive(Deserialize)]
-struct SessionList {
-    sessions: Vec<SessionEntry>,
+struct Snapshot {
+    #[serde(deserialize_with = "lua_list")]
+    sessions: Vec<SnapshotSession>,
 }
 
 #[derive(Deserialize)]
-struct SessionEntry {
+struct SnapshotSession {
     session_id: SessionId,
-}
-
-#[derive(Deserialize)]
-struct Status {
-    host_id: String,
-}
-
-#[derive(Deserialize)]
-struct View {
     label: String,
-    #[serde(default)]
-    windows: Option<Vec<ViewWindow>>,
+    #[serde(deserialize_with = "lua_list")]
+    windows: Vec<SnapshotWindow>,
 }
 
 #[derive(Deserialize)]
-struct ViewWindow {
+struct SnapshotWindow {
     window_id: WindowId,
-    #[serde(default)]
-    layers: Option<Vec<ViewLayer>>,
+    #[serde(deserialize_with = "lua_list")]
+    blocks: Vec<BlockId>,
+    #[serde(deserialize_with = "lua_list")]
+    terminals: Vec<TerminalFolder>,
 }
 
+/// What a terminal knows of its folder: its foreground process's, or else the one its
+/// shell last reported.
 #[derive(Deserialize)]
-struct ViewLayer {
-    kind: String,
-    #[serde(default)]
-    blocks: Option<Vec<ViewBlock>>,
-}
-
-#[derive(Deserialize)]
-struct ViewBlock {
-    block_id: BlockId,
-    #[serde(default)]
-    creator_name: Option<String>,
-    #[serde(default)]
-    host_id: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct Process {
-    #[serde(default)]
-    foreground: Option<ProcessInfo>,
-}
-
-#[derive(Deserialize)]
-struct ProcessInfo {
+struct TerminalFolder {
     #[serde(default)]
     cwd: Option<PathBuf>,
-}
-
-#[derive(Deserialize)]
-struct Pwd {
     #[serde(default)]
     pwd: Option<String>,
 }
 
-/// A window's blocks from a view, before their folders are looked up.
-struct ViewedWindow {
-    id: WindowId,
-    terminals: Vec<BlockId>,
-    blocks: Vec<BlockId>,
+impl TerminalFolder {
+    fn folder(self) -> Option<PathBuf> {
+        self.cwd
+            .or_else(|| self.pwd.as_deref().and_then(reported_path))
+    }
 }
 
-struct ViewedSession {
-    id: SessionId,
-    label: String,
-    windows: Vec<ViewedWindow>,
-}
-
-/// The server's host ID, which blocks on this machine share.
-pub(crate) fn host_id(api: &dyn RexApi) -> Result<String, RexError> {
-    let status: Status = decode("server.status", api.call("server.status", &json!({}))?)?;
-    Ok(status.host_id)
-}
-
-/// Reads every session, then every terminal's folder, each step all at once: one after
-/// another, the calls add up to most of the time an open takes.
-pub(crate) fn read(api: &dyn RexApi, host_id: &str) -> Result<Live, RexError> {
-    let list: SessionList = decode("session.list", api.call("session.list", &json!({}))?)?;
-    let viewed: Vec<ViewedSession> = in_parallel(&list.sessions, |entry| {
-        view(api, &entry.session_id, host_id)
-    })?
-    .into_iter()
-    .flatten()
-    .collect();
-
-    let terminals: Vec<(&SessionId, &BlockId)> = viewed
-        .iter()
-        .flat_map(|session| {
-            session
-                .windows
-                .iter()
-                .flat_map(|window| window.terminals.iter().map(|block| (&session.id, block)))
-        })
-        .collect();
-    let mut folders = in_parallel(&terminals, |(session, block)| {
-        block_folder(api, session, block)
-    })?
-    .into_iter();
-
+/// Reads every session, its windows, and where their terminals are, all in one script.
+pub(crate) fn read(api: &dyn RexApi) -> Result<Live, RexError> {
+    let snapshot: Snapshot = decode(
+        scripts::SNAPSHOT.name,
+        api.script(&scripts::SNAPSHOT, &json!({}))?,
+    )?;
     Ok(Live {
-        sessions: viewed
+        sessions: snapshot
+            .sessions
             .into_iter()
             .map(|session| LiveSession {
-                id: session.id,
+                id: session.session_id,
                 label: session.label,
                 windows: session
                     .windows
                     .into_iter()
                     .map(|window| LiveWindow {
-                        id: window.id,
+                        id: window.window_id,
                         folders: window
                             .terminals
-                            .iter()
-                            .map(|_| folders.next().expect("a folder for every terminal"))
+                            .into_iter()
+                            .map(TerminalFolder::folder)
                             .collect(),
                         blocks: window.blocks,
                     })
@@ -223,52 +163,6 @@ pub(crate) fn read(api: &dyn RexApi, host_id: &str) -> Result<Live, RexError> {
     })
 }
 
-/// A session's windows, or `None` if it closed since it was listed.
-fn view(
-    api: &dyn RexApi,
-    session: &SessionId,
-    host_id: &str,
-) -> Result<Option<ViewedSession>, RexError> {
-    let view: View = match api.call("session.view", &json!({ "session_id": session })) {
-        Ok(view) => decode("session.view", view)?,
-        Err(error) if error.code() == Some("session_not_found") => return Ok(None),
-        Err(error) => return Err(error),
-    };
-    let windows = view
-        .windows
-        .unwrap_or_default()
-        .into_iter()
-        .map(|window| {
-            let layers = window.layers.unwrap_or_default();
-            let terminals = layers
-                .iter()
-                .filter(|layer| layer.kind == TILED_LAYER)
-                .flat_map(|layer| layer.blocks.iter().flatten())
-                .filter(|block| {
-                    block.creator_name.as_deref() == Some(TERMINAL_CREATOR)
-                        && block.host_id.as_deref() == Some(host_id)
-                })
-                .map(|block| block.block_id.clone())
-                .collect();
-            let blocks = layers
-                .iter()
-                .flat_map(|layer| layer.blocks.iter().flatten())
-                .map(|block| block.block_id.clone())
-                .collect();
-            ViewedWindow {
-                id: window.window_id,
-                terminals,
-                blocks,
-            }
-        })
-        .collect();
-    Ok(Some(ViewedSession {
-        id: session.clone(),
-        label: view.label,
-        windows,
-    }))
-}
-
 /// Where a terminal is: its foreground process's folder, or else the folder its shell
 /// last reported. `None` if neither is known or the block has closed.
 pub(crate) fn block_folder(
@@ -276,21 +170,51 @@ pub(crate) fn block_folder(
     session: &SessionId,
     block: &BlockId,
 ) -> Result<Option<PathBuf>, RexError> {
-    let args = json!({ "session_id": session, "block_id": block, "args": {} });
-    let process: Process = match api.call("com.superlogical.terminal.process", &args) {
-        Ok(process) => decode("com.superlogical.terminal.process", process)?,
-        Err(error) if error.code() == Some("not_found") => return Ok(None),
-        Err(error) => return Err(error),
-    };
-    if let Some(cwd) = process.foreground.and_then(|foreground| foreground.cwd) {
-        return Ok(Some(cwd));
+    let folder: TerminalFolder = decode(
+        scripts::FOLDER.name,
+        api.script(
+            &scripts::FOLDER,
+            &json!({ "session_id": session, "block_id": block }),
+        )?,
+    )?;
+    Ok(folder.folder())
+}
+
+/// A list a script returned. Lua cannot tell an empty list from an empty table, which
+/// Rex turns into an empty object, so that is read as an empty list too.
+fn lua_list<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    struct ListVisitor<T>(PhantomData<T>);
+
+    impl<'de, T: Deserialize<'de>> Visitor<'de> for ListVisitor<T> {
+        type Value = Vec<T>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("a list, or an empty object for an empty list")
+        }
+
+        fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Vec<T>, A::Error> {
+            let mut items = Vec::with_capacity(seq.size_hint().unwrap_or(0));
+            while let Some(item) = seq.next_element()? {
+                items.push(item);
+            }
+            Ok(items)
+        }
+
+        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Vec<T>, A::Error> {
+            match map.next_key::<String>()? {
+                None => Ok(Vec::new()),
+                Some(key) => Err(de::Error::custom(format!(
+                    "expected a list, found an object with the key {key:?}"
+                ))),
+            }
+        }
     }
-    let pwd: Pwd = match api.call("com.superlogical.terminal.pwd", &args) {
-        Ok(pwd) => decode("com.superlogical.terminal.pwd", pwd)?,
-        Err(error) if error.code() == Some("not_found") => return Ok(None),
-        Err(error) => return Err(error),
-    };
-    Ok(pwd.pwd.as_deref().and_then(reported_path))
+
+    deserializer.deserialize_any(ListVisitor(PhantomData))
 }
 
 /// The path in a reported working directory: a `file://` URL from OSC 7, or a plain path.
@@ -320,31 +244,25 @@ fn percent_decode(text: &str) -> Option<String> {
     String::from_utf8(decoded).ok()
 }
 
-/// Runs `work` on every item at once and collects the results in order.
-fn in_parallel<T: Sync, R: Send>(
-    items: &[T],
-    work: impl Fn(&T) -> Result<R, RexError> + Sync,
-) -> Result<Vec<R>, RexError> {
-    std::thread::scope(|scope| {
-        let work = &work;
-        let running: Vec<_> = items
-            .iter()
-            .map(|item| scope.spawn(move || work(item)))
-            .collect();
-        running
-            .into_iter()
-            .map(|handle| {
-                handle
-                    .join()
-                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
-            })
-            .collect()
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn script_lists_may_be_empty_objects_but_not_other_objects() {
+        #[derive(Debug, Deserialize)]
+        struct Holder {
+            #[serde(deserialize_with = "lua_list")]
+            items: Vec<u8>,
+        }
+        let read = |value: serde_json::Value| serde_json::from_value::<Holder>(value);
+
+        assert_eq!(read(json!({ "items": [1, 2] })).unwrap().items, [1, 2]);
+        assert_eq!(read(json!({ "items": {} })).unwrap().items, [0u8; 0]);
+        let error = read(json!({ "items": { "a": 1 } })).unwrap_err();
+        assert!(error.to_string().contains("found an object"), "{error}");
+        assert!(read(json!({ "items": "x" })).is_err());
+    }
 
     #[test]
     fn reported_directories_can_be_file_urls_or_paths() {

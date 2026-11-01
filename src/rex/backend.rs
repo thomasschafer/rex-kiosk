@@ -11,7 +11,7 @@ use std::{
     collections::HashMap,
     io::Write,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, OnceLock},
+    sync::{Arc, Mutex},
 };
 
 use kiosk_core::{
@@ -22,14 +22,14 @@ use kiosk_core::{
     git::{GitProvider, Worktree},
     path::{canonical_or_original, equivalent},
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use super::{
-    BlockId, ClientId, RexApi, RexError, SessionId, WindowId, WindowRef, decode,
+    BlockId, ClientId, RexApi, RexError, SessionId, WindowRef, decode,
     layout::Layout,
     live::{self, Live, LiveSession, LiveWindow},
-    path_arg,
+    path_arg, scripts,
 };
 use kiosk_core::config::OnOpenConfig;
 
@@ -56,26 +56,32 @@ pub struct Rex {
     /// Where notifications are written, as terminal escape sequences: the picker's own
     /// terminal, which passes them to the Rex app.
     notices: Mutex<Box<dyn Write + Send>>,
-    host_id: OnceLock<String>,
     /// The checkout each window was last listed as showing, so a window can be named by
     /// its checkout once that is gone.
     shown: Mutex<HashMap<WindowRef, PathBuf>>,
+    /// The main checkout of each folder Git has been asked about, or `None` for a folder
+    /// in no repository. Asking takes a Git process each, and a picker opening something
+    /// asks again about the windows it listed as it loaded.
+    main_checkouts: Mutex<HashMap<PathBuf, Option<PathBuf>>>,
 }
 
-#[derive(Deserialize)]
-struct Created {
-    session_id: SessionId,
-    initial_windows: Vec<CreatedWindow>,
-}
-
-#[derive(Deserialize)]
-struct CreatedWindow {
-    window_id: WindowId,
-}
-
-#[derive(Deserialize)]
-struct NewWindow {
-    window_id: WindowId,
+/// What `open.lua` opens: a window that is already there, or one it makes.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum Opening<'a> {
+    Existing(&'a WindowRef),
+    /// A window for a checkout of the repository the session shows.
+    NewWindow {
+        session_id: &'a SessionId,
+        window_label: String,
+        layout: &'a Layout,
+    },
+    /// A session with its one window, made all at once so no app sees it half made.
+    NewSession {
+        label: String,
+        window_label: String,
+        layout: &'a Layout,
+    },
 }
 
 #[derive(Deserialize)]
@@ -120,8 +126,8 @@ impl Rex {
             on_open,
             launch,
             notices: Mutex::new(notices),
-            host_id: OnceLock::new(),
             shown: Mutex::new(HashMap::new()),
+            main_checkouts: Mutex::new(HashMap::new()),
         }
     }
 
@@ -130,13 +136,36 @@ impl Rex {
     }
 
     fn live(&self) -> Result<Live, RexError> {
-        let host_id = if let Some(host_id) = self.host_id.get() {
-            host_id
-        } else {
-            let host_id = live::host_id(self.api.as_ref())?;
-            self.host_id.get_or_init(|| host_id)
+        live::read(self.api.as_ref())
+    }
+
+    /// The main checkout of the repository each of `folders` is in, if any, asking Git
+    /// about the folders it has not been asked about all at once.
+    fn main_checkouts(&self, folders: &[PathBuf]) -> Result<Vec<Option<PathBuf>>, RexError> {
+        let mut unknown: Vec<PathBuf> = {
+            let cache = self.lock_main_checkouts();
+            folders
+                .iter()
+                .filter(|folder| !cache.contains_key(*folder))
+                .cloned()
+                .collect()
         };
-        live::read(self.api.as_ref(), host_id)
+        unknown.sort();
+        unknown.dedup();
+        let found = in_parallel(&unknown, |folder| {
+            self.git
+                .main_checkout(folder)
+                .map_err(|error| git_error(&error))
+        })?;
+        let mut cache = self.lock_main_checkouts();
+        cache.extend(unknown.into_iter().zip(found));
+        Ok(folders.iter().map(|folder| cache[folder].clone()).collect())
+    }
+
+    fn lock_main_checkouts(&self) -> std::sync::MutexGuard<'_, HashMap<PathBuf, Option<PathBuf>>> {
+        self.main_checkouts
+            .lock()
+            .expect("the main checkout cache is not poisoned")
     }
 
     /// The folder `block` of `session` is in, for preselecting where the user was.
@@ -156,15 +185,16 @@ impl Rex {
             .map_err(|error| git_error(&error))
     }
 
-    /// Makes `target` the active window of its session and shows it in the Rex app.
-    fn show(&self, target: &WindowRef) -> Result<(), RexError> {
-        let ids = json!({ "session_id": target.session, "window_id": target.window });
-        self.call("session.focus_window", &ids)?;
-        match self.api.perform(&self.client()?, "session.select", &ids) {
+    /// Makes the window `opening` asks for if there isn't one, makes it the active window
+    /// of its session, and shows it in the Rex app, all in one script.
+    fn open(&self, opening: &Opening) -> Result<WindowRef, RexError> {
+        let args = json!({ "client_id": self.client()?, "opening": opening });
+        match self.api.script(&scripts::OPEN, &args) {
+            Ok(opened) => decode(scripts::OPEN.name, opened),
             Err(error) if error.to_string().contains("Remote Control") => {
                 Err(RexError::RemoteControlOff)
             }
-            performed => performed,
+            Err(error) => Err(error),
         }
     }
 
@@ -210,21 +240,23 @@ impl Rex {
         label: &str,
     ) -> Result<Option<&'a LiveSession>, RexError> {
         let repo = canonical_or_original(repo);
+        let places: Vec<Option<PathBuf>> = live
+            .sessions
+            .iter()
+            .map(|session| session.windows.iter().find_map(LiveWindow::place))
+            .collect();
+        let known_places: Vec<PathBuf> = places.iter().flatten().cloned().collect();
+        let mut mains = self.main_checkouts(&known_places)?.into_iter();
         let mut by_folder = Vec::new();
         let mut by_label = Vec::new();
-        for session in &live.sessions {
-            match session.windows.iter().find_map(LiveWindow::place) {
-                Some(place) => {
-                    let main = self
-                        .git
-                        .main_checkout(&place)
-                        .map_err(|error| git_error(&error))?;
-                    if main.is_some_and(|main| equivalent(&canonical_or_original(&main), &repo)) {
-                        by_folder.push(session);
-                    }
+        for (session, place) in live.sessions.iter().zip(&places) {
+            if place.is_some() {
+                let main = mains.next().expect("a main checkout for every place");
+                if main.is_some_and(|main| equivalent(&canonical_or_original(&main), &repo)) {
+                    by_folder.push(session);
                 }
-                None if session.label == label => by_label.push(session),
-                None => {}
+            } else if session.label == label {
+                by_label.push(session);
             }
         }
         let candidates = if by_folder.is_empty() {
@@ -255,62 +287,6 @@ impl Rex {
             }),
         }
     }
-
-    fn new_window(
-        &self,
-        session: &SessionId,
-        label: &str,
-        layout: &Layout,
-    ) -> Result<WindowRef, RexError> {
-        let created: NewWindow = decode(
-            "session.new_window",
-            self.call(
-                "session.new_window",
-                &json!({
-                    "session_id": session,
-                    "window_label": truncate_label(label),
-                    "layout": layout,
-                }),
-            )?,
-        )?;
-        Ok(WindowRef {
-            session: session.clone(),
-            window: created.window_id,
-        })
-    }
-
-    /// Creates a session with one window, all at once, so no app sees it half made.
-    fn new_session(
-        &self,
-        label: &str,
-        window_label: &str,
-        layout: &Layout,
-    ) -> Result<WindowRef, RexError> {
-        let created: Created = decode(
-            "session.create",
-            self.call(
-                "session.create",
-                &json!({
-                    "label": truncate_label(label),
-                    "initial_windows": [{
-                        "window_label": truncate_label(window_label),
-                        "layout": layout,
-                    }],
-                }),
-            )?,
-        )?;
-        let [window] =
-            <[CreatedWindow; 1]>::try_from(created.initial_windows).map_err(|windows| {
-                RexError::InvalidResponse(format!(
-                    "session.create made {} windows, not the one asked for",
-                    windows.len()
-                ))
-            })?;
-        Ok(WindowRef {
-            session: created.session_id,
-            window: window.window_id,
-        })
-    }
 }
 
 impl Backend for Rex {
@@ -318,16 +294,17 @@ impl Backend for Rex {
     type Error = RexError;
 
     fn open_repos(&self) -> Result<Vec<PathBuf>, RexError> {
-        self.live()?
+        let places: Vec<PathBuf> = self
+            .live()?
             .window_places()
             .into_iter()
-            .filter_map(|place| {
-                self.git
-                    .main_checkout(&place.folder)
-                    .map_err(|error| git_error(&error))
-                    .transpose()
-            })
-            .collect()
+            .map(|place| place.folder)
+            .collect();
+        Ok(self
+            .main_checkouts(&places)?
+            .into_iter()
+            .flatten()
+            .collect())
     }
 
     fn open_folders(&self) -> Result<Vec<PathBuf>, RexError> {
@@ -371,7 +348,7 @@ impl Backend for Rex {
             .collect();
         let live = self.live()?;
         if let Some(window) = session_showing_checkout(&live.window_places(), checkout, &paths) {
-            self.show(window)?;
+            self.open(&Opening::Existing(window))?;
             return Ok(Opened::default());
         }
         let canonical = canonical_or_original(checkout);
@@ -391,24 +368,35 @@ impl Backend for Rex {
             None => folder_label(&worktree.path)?,
         };
         let layout = Layout::checkout(&path_arg("checkout", &worktree.path)?, &self.on_open);
-        let window = match self.repo_session(&live, repo, &repo_label)? {
-            Some(session) => self.new_window(&session.id, &window_label, &layout)?,
-            None => self.new_session(&repo_label, &window_label, &layout)?,
+        let opening = match self.repo_session(&live, repo, &repo_label)? {
+            Some(session) => Opening::NewWindow {
+                session_id: &session.id,
+                window_label: truncate_label(&window_label),
+                layout: &layout,
+            },
+            None => Opening::NewSession {
+                label: truncate_label(&repo_label),
+                window_label: truncate_label(&window_label),
+                layout: &layout,
+            },
         };
-        self.show(&window)?;
+        self.open(&opening)?;
         Ok(Opened::default())
     }
 
     fn open_folder(&self, folder: &Path) -> Result<Opened, RexError> {
         let cwd = path_arg("folder", folder)?;
         let terminals = self.live()?.terminal_folders();
-        let window = if let Some(window) = session_in_folder(&terminals, folder) {
-            window.clone()
+        if let Some(window) = session_in_folder(&terminals, folder) {
+            self.open(&Opening::Existing(window))?;
         } else {
-            let label = folder_label(folder)?;
-            self.new_session(&label, &label, &Layout::folder(&cwd))?
-        };
-        self.show(&window)?;
+            let label = truncate_label(&folder_label(folder)?);
+            self.open(&Opening::NewSession {
+                label: label.clone(),
+                window_label: label,
+                layout: &Layout::folder(&cwd),
+            })?;
+        }
         Ok(Opened::default())
     }
 
@@ -553,6 +541,28 @@ fn notice_text(text: &str) -> String {
 
 fn git_error(error: &anyhow::Error) -> RexError {
     RexError::Git(format!("{error:#}"))
+}
+
+/// Runs `work` on every item at once and collects the results in order.
+fn in_parallel<T: Sync, R: Send>(
+    items: &[T],
+    work: impl Fn(&T) -> Result<R, RexError> + Sync,
+) -> Result<Vec<R>, RexError> {
+    std::thread::scope(|scope| {
+        let work = &work;
+        let running: Vec<_> = items
+            .iter()
+            .map(|item| scope.spawn(move || work(item)))
+            .collect();
+        running
+            .into_iter()
+            .map(|handle| {
+                handle
+                    .join()
+                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+            })
+            .collect()
+    })
 }
 
 #[cfg(test)]
