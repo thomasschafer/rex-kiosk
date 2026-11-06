@@ -1,5 +1,8 @@
 # rex-kiosk
 
+> [!NOTE]
+> This repository is archived and no longer maintained. Kiosk now lives on as a picker for the [Herdr desktop app](https://herdr.dev), at [thomasschafer/kiosk](https://github.com/thomasschafer/kiosk).
+
 Fuzzy-find Git repositories (or any folder) and branches, then open them in
 [Rex](https://www.superlogical.com/rex/). Each repository gets one Rex session with a
 tab for each branch you open, and a branch without a checkout gets a Git worktree. The
